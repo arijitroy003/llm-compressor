@@ -9,25 +9,12 @@ from compressed_tensors.quantization.quant_args import FloatArgs
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 
 from llmcompressor.core import active_session
-from llmcompressor.observers.base import MinMaxTuple
+from llmcompressor.observers.base import MinMaxTuple, _CustomFP8ScaleData
 
 # Allow torch.compile to handle scalar conversions inside
 # compressed_tensors' calculate_qparams (float(bit_range)).
 # Same approach as GPTQ compile path (commit a4f9ba2e).
 torch._dynamo.config.capture_scalar_outputs = True
-
-
-def _make_scale_data(global_scale_max: float) -> type:
-    """Create a FloatArgs subclass with a custom FP8 max for generate_gparam."""
-
-    class _CustomFP8ScaleData(FloatArgs):
-        exponent = 4
-        mantissa = 3
-        bits = 8
-        max = global_scale_max
-        min = -global_scale_max
-
-    return _CustomFP8ScaleData
 
 
 def _grid_search_mse(
@@ -77,7 +64,7 @@ def _grid_search_mse(
         global_absmax = torch.max(-original_min.min(), original_max.max())
         gparam_kwargs = {}
         if global_scale_max is not None:
-            gparam_kwargs["scale_data"] = _make_scale_data(global_scale_max)
+            gparam_kwargs["scale_data"] = _CustomFP8ScaleData(max=global_scale_max, min=-global_scale_max)
         global_scale = generate_gparam(
             -global_absmax.reshape(1), global_absmax.reshape(1), **gparam_kwargs
         )
