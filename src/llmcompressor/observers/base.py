@@ -6,6 +6,7 @@ import torch
 from compressed_tensors import InternalModule
 from compressed_tensors.offload.dist_utils import as_broadcastable
 from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
+from compressed_tensors.quantization.quant_args import FloatArgs
 from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 from compressed_tensors.registry.registry import RegistryMixin
 from torch import distributed as dist
@@ -97,8 +98,21 @@ class Observer(InternalModule, RegistryMixin):
                     fused_obs(fused_mod.weight)
                 global_absmax = torch.max(global_absmax, -fused_obs.min_vals.min())
                 global_absmax = torch.max(global_absmax, fused_obs.max_vals.max())
+            
+            # enable specific global scale max for nvfp4
+            gparam_kwargs = {}
+            gs_max = (self.args.observer_kwargs or {}).get("global_scale_max")
+            if gs_max is not None:
+                class _CustomFP8ScaleData(FloatArgs):
+                    exponent = 4
+                    mantissa = 3
+                    bits = 8
+                    max = gs_max
+                    min = -gs_max
+
+                gparam_kwargs["scale_data"] = _CustomFP8ScaleData
             global_scale = generate_gparam(
-                -global_absmax.reshape(1), global_absmax.reshape(1)
+                -global_absmax.reshape(1), global_absmax.reshape(1), **gparam_kwargs
             )
 
         scale, zero_point = calculate_qparams(

@@ -3,9 +3,10 @@ from typing import Tuple
 import torch
 import torch._dynamo.config
 import torch._dynamo.decorators
-from compressed_tensors.quantization import QuantizationArgs
+from compressed_tensors.quantization import QuantizationArgs, QuantizationStrategy
 from compressed_tensors.quantization.lifecycle import fake_quantize
-from compressed_tensors.quantization.utils import calculate_qparams
+from compressed_tensors.quantization.quant_args import FloatArgs
+from compressed_tensors.quantization.utils import calculate_qparams, generate_gparam
 
 from llmcompressor.core import active_session
 from llmcompressor.observers.base import MinMaxTuple
@@ -14,6 +15,19 @@ from llmcompressor.observers.base import MinMaxTuple
 # compressed_tensors' calculate_qparams (float(bit_range)).
 # Same approach as GPTQ compile path (commit a4f9ba2e).
 torch._dynamo.config.capture_scalar_outputs = True
+
+
+def _make_scale_data(global_scale_max: float) -> type:
+    """Create a FloatArgs subclass with a custom FP8 max for generate_gparam."""
+
+    class _CustomFP8ScaleData(FloatArgs):
+        exponent = 4
+        mantissa = 3
+        bits = 8
+        max = global_scale_max
+        min = -global_scale_max
+
+    return _CustomFP8ScaleData
 
 
 def _grid_search_mse(
@@ -25,6 +39,8 @@ def _grid_search_mse(
     grid: float,
     norm: float,
     chunk_size: int,
+    expand: float = 1.0,
+    global_scale_max: float | None = None,
 ) -> MinMaxTuple:
     """Find per-channel min/max ranges that minimize quantization error.
 
@@ -44,12 +60,27 @@ def _grid_search_mse(
         in shrink factors
     :param norm: exponent used when computing the error. norm = 2 approximates MSE
     :param chunk_size: number of grid steps per compiled call
+    :param expand: factor to scale the initial min/max range before searching.
+        Values > 1.0 let the search explore ranges wider than the observed
+        values (e.g. expand=2.0 starts at 2x the observed range).
     """
-    min_val = torch.amin(observed, dim=(0, -1))
-    max_val = torch.amax(observed, dim=(0, -1))
+    original_min = torch.amin(observed, dim=(0, -1))
+    original_max = torch.amax(observed, dim=(0, -1))
+    min_val = original_min * expand
+    max_val = original_max * expand
     best_error = torch.full_like(min_val, torch.finfo(min_val.dtype).max)
     best_min_val = min_val.clone()
     best_max_val = max_val.clone()
+
+    global_scale = None
+    if args.strategy == QuantizationStrategy.TENSOR_GROUP:
+        global_absmax = torch.max(-original_min.min(), original_max.max())
+        gparam_kwargs = {}
+        if global_scale_max is not None:
+            gparam_kwargs["scale_data"] = _make_scale_data(global_scale_max)
+        global_scale = generate_gparam(
+            -global_absmax.reshape(1), global_absmax.reshape(1), **gparam_kwargs
+        )
 
     total_steps = int(maxshrink * grid)
 
@@ -68,6 +99,7 @@ def _grid_search_mse(
             grid,
             norm,
             chunk_size,
+            global_scale,
         )
     return _grid_search_eager(
         observed,
@@ -82,6 +114,7 @@ def _grid_search_mse(
         patience,
         grid,
         norm,
+        global_scale,
     )
 
 
@@ -98,6 +131,7 @@ def _grid_search_eager(
     patience: int,
     grid: float,
     norm: float,
+    global_scale: torch.Tensor | None = None,
 ) -> MinMaxTuple:
     """Per-step grid search with boolean-indexing updates and early stopping."""
     no_improve_count = 0
@@ -114,6 +148,7 @@ def _grid_search_eager(
             shrinked_min_val,
             shrinked_max_val,
             norm,
+            global_scale,
         )
 
         improved = err < best_error
@@ -144,6 +179,7 @@ def _grid_search_compiled(
     grid: float,
     norm: float,
     chunk_size: int,
+    global_scale: torch.Tensor | None = None,
 ) -> MinMaxTuple:
     """Chunked grid search using torch.compiled inner loop.
 
@@ -183,6 +219,7 @@ def _grid_search_compiled(
             best_error,
             best_min_val,
             best_max_val,
+            global_scale,
         )
 
         if torch.equal(prev_best, best_error):
@@ -209,6 +246,7 @@ def _compute_chunk(
     best_error: torch.Tensor,
     best_min_val: torch.Tensor,
     best_max_val: torch.Tensor,
+    global_scale: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Evaluate ``chunk_size`` shrink-factor candidates in one call.
 
@@ -231,6 +269,7 @@ def _compute_chunk(
             shrinked_min,
             shrinked_max,
             norm,
+            global_scale,
         )
 
         improved = err < best_error
@@ -248,6 +287,7 @@ def _calculate_error(
     shrinked_min: torch.Tensor,
     shrinked_max: torch.Tensor,
     norm: float,
+    global_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Fake-quantize ``observed`` using the given shrinked min/max range and
     return the per-channel error.
@@ -258,7 +298,7 @@ def _calculate_error(
         min_vals=shrinked_min,
         max_vals=shrinked_max,
         quantization_args=args,
-        global_scale=None,
+        global_scale=global_scale,
     )
 
     q = fake_quantize(
@@ -266,6 +306,7 @@ def _calculate_error(
         candidate_scales.unsqueeze(-1),
         candidate_zero_points.unsqueeze(-1),
         token_args,
+        global_scale=global_scale,
     ).to(observed.dtype)
 
     err = torch.sum((q - observed).abs().pow(norm), dim=(0, -1))
